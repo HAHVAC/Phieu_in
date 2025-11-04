@@ -122,7 +122,7 @@ export default async function handler(req, res) {
         items.push({
           name: f.ten_vthh || f['Tên VTHH'] || f.name || '',
           unit: f.don_vi_tinh || f['Đơn vị tính'] || f.unit || '',
-          qty: f.so_luong || f['Số lượng'] || f.qty || '',
+          qty: f.so_luong || f['Tồn đầu kỳ'] || f.qty || '',
           note: f.ghi_chu || f.note || ''
         });
       }
@@ -133,10 +133,10 @@ export default async function handler(req, res) {
       so_phieu: so,
       hang_muc: found.fields?.hang_muc || found.fields?.['Hạng mục'] || '',
       nhom_ncc: found.fields?.nhom_ncc || found.fields?.['Nhóm NCC'] || '',
-      noi_dung: found.fields?.noi_dung || found.fields?.['Nội dung'] || '',
+      noi_dung: found.fields?.noi_dung || found.fields?.['Nội dung xuất'] || '',
       nha_cung: found.fields?.nha_cung || found.fields?.['Nhà cung cấp'] || '',
       xuong: found.fields?.xuong || found.fields?.['Xưởng'] || '',
-      ngay_xuat: found.fields?.ngay_xuat || found.fields?.['Ngày xuất'] || '',
+      ngay_xuat: found.fields?.ngay_xuat || found.fields?.['Ngày xuất nhập'] || '',
       nguoi_lap: found.fields?.nguoi_lap || found.fields?.['Người lập'] || '',
       items
     };
