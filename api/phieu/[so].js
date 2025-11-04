@@ -1,5 +1,5 @@
 // api/phieu/[so].js
-import fetch from "node-fetch"; // nếu vercel hỗ trợ native fetch bạn có thể bỏ import
+// import fetch from "node-fetch"; // nếu vercel hỗ trợ native fetch bạn có thể bỏ import
 
 const LARK_DOMAIN = process.env.LARK_DOMAIN || "https://open.larksuite.com";
 // endpoints
