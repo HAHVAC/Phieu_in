@@ -1,6 +1,8 @@
 // api/phieu/[so].js
-// Full handler: robust search + batch_get items + parse item fields + preserve order
-// Env vars required: LARK_APP_ID, LARK_APP_SECRET, PHIEU_APP_TOKEN, PHIEU_TABLE_ID, DATA_APP_TOKEN (opt), DATA_TABLE_ID (opt)
+// Full handler với fallback auto-detect DATA_TABLE_ID từ field "Danh sách mặt hàng"
+// Required envs: LARK_APP_ID, LARK_APP_SECRET, PHIEU_APP_TOKEN, PHIEU_TABLE_ID
+// Optional envs: DATA_APP_TOKEN, DATA_TABLE_ID
+// Default LARK_DOMAIN = https://open.larksuite.com
 
 export default async function handler(req, res) {
   try {
@@ -10,7 +12,7 @@ export default async function handler(req, res) {
     const LARK_DOMAIN = process.env.LARK_DOMAIN || "https://open.larksuite.com";
     const TENANT_TOKEN_URL = `${LARK_DOMAIN}/open-apis/auth/v3/tenant_access_token/internal`;
 
-    // --- 1) tenant token (in-memory cache)
+    // --- tenant token cache (in-memory)
     if (!global.__tenantToken || (global.__tenantExpire || 0) < Date.now()) {
       const r = await fetch(TENANT_TOKEN_URL, {
         method: "POST",
@@ -18,16 +20,20 @@ export default async function handler(req, res) {
         body: JSON.stringify({ app_id: process.env.LARK_APP_ID, app_secret: process.env.LARK_APP_SECRET })
       });
       const j = await r.json();
-      if (!j.tenant_access_token) return res.status(500).json({ error: "cannot fetch tenant token", raw: j });
+      if (!j.tenant_access_token) {
+        return res.status(500).json({ error: "cannot fetch tenant token", raw: j });
+      }
       global.__tenantToken = j.tenant_access_token;
       global.__tenantExpire = Date.now() + ((j.expire || 7200) * 1000) - 30000;
     }
     const token = global.__tenantToken;
 
-    // --- 2) list records from PHIEU table
+    // --- list records from PHIEU table
     const PHIEU_APP_TOKEN = process.env.PHIEU_APP_TOKEN;
     const PHIEU_TABLE_ID = process.env.PHIEU_TABLE_ID;
-    if (!PHIEU_APP_TOKEN || !PHIEU_TABLE_ID) return res.status(500).json({ error: "Missing PHIEU_APP_TOKEN or PHIEU_TABLE_ID env vars" });
+    if (!PHIEU_APP_TOKEN || !PHIEU_TABLE_ID) {
+      return res.status(500).json({ error: "Missing PHIEU_APP_TOKEN or PHIEU_TABLE_ID env vars" });
+    }
 
     const listUrl = `${LARK_DOMAIN}/open-apis/bitable/v1/apps/${PHIEU_APP_TOKEN}/tables/${PHIEU_TABLE_ID}/records`;
     const listResp = await fetch(listUrl, { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }});
@@ -38,7 +44,7 @@ export default async function handler(req, res) {
     const listJson = await listResp.json();
     const records = (listJson?.data?.items) || (listJson?.records) || [];
 
-    // --- 3) helpers
+    // --- helpers
     function normalizeAlnum(s){
       if (s === undefined || s === null) return "";
       return String(s).normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^0-9a-zA-Z]/g, '').toLowerCase();
@@ -51,10 +57,7 @@ export default async function handler(req, res) {
       return "";
     }
 
-    // debug sample keys
-    try { if (records && records.length) console.log("sample record keys:", Object.keys(records[0].fields || {})); } catch(e){}
-
-    // --- 4) build suffix candidates from input 'so'
+    // --- build suffix candidates from input 'so'
     const soNorm = normalizeAlnum(so);
     const soTokens = String(so).split(/[^0-9A-Za-z]+/).filter(Boolean).map(t=>t.toLowerCase());
     const suffixCandidates = [];
@@ -65,10 +68,8 @@ export default async function handler(req, res) {
 
     if (debug) console.log("soNorm:", soNorm, "suffixCandidates:", suffixCandidates);
 
-    // --- 5) FIND record using strategies
+    // --- find record: strategies: exact -> contains -> suffix tokens
     let record = null;
-
-    // exact normalized equality
     record = records.find(r => {
       const f = r.fields || r.field_values || {};
       for (const k of Object.keys(f||{})) {
@@ -79,7 +80,6 @@ export default async function handler(req, res) {
       return false;
     });
 
-    // normalized contains
     if (!record) {
       record = records.find(r => {
         const f = r.fields || r.field_values || {};
@@ -92,7 +92,6 @@ export default async function handler(req, res) {
       });
     }
 
-    // suffix matching
     if (!record) {
       record = records.find(r => {
         const f = r.fields || r.field_values || {};
@@ -108,7 +107,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // if still not found -> return sample candidates
+    // not found -> return sample candidates for debug
     if (!record) {
       const candidates = records.slice(0,10).map(r=>{
         const f = r.fields || r.field_values || {};
@@ -125,7 +124,7 @@ export default async function handler(req, res) {
       return res.status(404).json({ error: "Phiếu not found (normalized search)", so, total_records: records.length, sample_candidates: candidates });
     }
 
-    // --- 6) Build response meta
+    // --- response meta
     const f = record.fields || record.field_values || {};
     const resp = {
       so_phieu: f["Số phiếu"] || f["so_phieu"] || f["Số_phiếu"] || so,
@@ -139,7 +138,7 @@ export default async function handler(req, res) {
       items: []
     };
 
-    // --- 7) Extract linkedIds from potential item key
+    // --- detect potential item field key
     let linkedIds = [];
     const potentialItemKey = Object.keys(f||{}).find(k => {
       const lk = String(k).toLowerCase();
@@ -159,31 +158,81 @@ export default async function handler(req, res) {
 
     if (debug) console.log("potentialItemKey:", potentialItemKey, "linkedIds:", linkedIds);
 
-    // If debug and requested, optionally run batch_get and return debug info
+    // --- debug mode: return debug info and raw batch_get (if possible)
     if (debug === "1") {
       const dbg = { matched_record: record.record_id || record.id, potentialItemKey, linkedIds };
       if (linkedIds.length) {
-        const DATA_APP_TOKEN = process.env.DATA_APP_TOKEN || PHIEU_APP_TOKEN;
-        const DATA_TABLE_ID = process.env.DATA_TABLE_ID || process.env.PHIEU_TABLE_ID;
+        // attempt to auto-resolve data app/table and run batch_get
+        let DATA_APP_TOKEN = process.env.DATA_APP_TOKEN || PHIEU_APP_TOKEN;
+        let DATA_TABLE_ID  = process.env.DATA_TABLE_ID || process.env.PHIEU_TABLE_ID;
+
+        // auto-detect table_id from field value when available
+        try {
+          if (!process.env.DATA_TABLE_ID && potentialItemKey) {
+            const rawVal = f[potentialItemKey];
+            const first = Array.isArray(rawVal) && rawVal.length ? rawVal[0] : rawVal;
+            if (first && typeof first === 'object' && first.table_id) {
+              DATA_TABLE_ID = first.table_id;
+            }
+            if (first && typeof first === 'object' && first.table && first.table.id) {
+              DATA_TABLE_ID = first.table.id;
+            }
+            if (first && typeof first === 'object' && first.app_id) {
+              DATA_APP_TOKEN = first.app_id;
+            }
+          }
+        } catch(e){ dbg.table_detect_error = e.message; }
+
         if (DATA_APP_TOKEN && DATA_TABLE_ID) {
-          const batchUrl = `${LARK_DOMAIN}/open-apis/bitable/v1/apps/${DATA_APP_TOKEN}/tables/${DATA_TABLE_ID}/records/batch_get`;
-          const rBatch = await fetch(batchUrl, {
-            method: "POST",
-            headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-            body: JSON.stringify({ record_ids: linkedIds })
-          });
-          const raw = await rBatch.text();
-          try { dbg.batch_get = JSON.parse(raw); } catch(e){ dbg.batch_get_raw = raw; }
-        } else dbg.batch_get = "no_data_table_configured";
+          try {
+            const batchUrl = `${LARK_DOMAIN}/open-apis/bitable/v1/apps/${DATA_APP_TOKEN}/tables/${DATA_TABLE_ID}/records/batch_get`;
+            const rBatch = await fetch(batchUrl, {
+              method: "POST",
+              headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+              body: JSON.stringify({ record_ids: linkedIds })
+            });
+            const raw = await rBatch.text();
+            try { dbg.batch_get = JSON.parse(raw); } catch(e){ dbg.batch_get_raw = raw; }
+          } catch(e){
+            dbg.batch_get_error = e.message;
+          }
+        } else {
+          dbg.batch_get = "no_data_table_configured";
+        }
       }
       return res.status(200).json({ debug: dbg });
     }
 
-    // --- 8) If linkedIds present -> batch_get from DATA table and parse rows
+    // --- resolve DATA app/table with fallback to auto-detect table_id from field
+    let DATA_APP_TOKEN = process.env.DATA_APP_TOKEN || PHIEU_APP_TOKEN;
+    let DATA_TABLE_ID  = process.env.DATA_TABLE_ID || process.env.PHIEU_TABLE_ID;
+
+    // auto-detect DATA_TABLE_ID from field if present
+    try {
+      if (!process.env.DATA_TABLE_ID && potentialItemKey) {
+        const rawVal = f[potentialItemKey];
+        const first = Array.isArray(rawVal) && rawVal.length ? rawVal[0] : rawVal;
+        if (first && typeof first === 'object' && first.table_id) {
+          DATA_TABLE_ID = first.table_id;
+          console.log("Auto-detected DATA_TABLE_ID from field:", DATA_TABLE_ID);
+        }
+        if (first && typeof first === 'object' && first.table && first.table.id) {
+          DATA_TABLE_ID = first.table.id;
+          console.log("Auto-detected DATA_TABLE_ID from field.table:", DATA_TABLE_ID);
+        }
+        if (first && typeof first === 'object' && first.app_id) {
+          DATA_APP_TOKEN = first.app_id;
+          console.log("Auto-detected DATA_APP_TOKEN from field:", DATA_APP_TOKEN);
+        }
+      }
+    } catch(e){
+      console.warn("table_id extraction failed:", e && e.message);
+    }
+
+    // --- batch_get details if linkedIds available
     if (linkedIds.length > 0) {
-      const DATA_APP_TOKEN = process.env.DATA_APP_TOKEN || PHIEU_APP_TOKEN;
-      const DATA_TABLE_ID = process.env.DATA_TABLE_ID || process.env.PHIEU_TABLE_ID;
       if (!DATA_APP_TOKEN || !DATA_TABLE_ID) {
+        // cannot batch_get: return record_ids for debug
         resp.items = linkedIds.map(id => ({ record_id: id }));
       } else {
         const batchUrl = `${LARK_DOMAIN}/open-apis/bitable/v1/apps/${DATA_APP_TOKEN}/tables/${DATA_TABLE_ID}/records/batch_get`;
@@ -259,7 +308,7 @@ export default async function handler(req, res) {
               record_id: row.record_id || row.id || null,
               name, unit, qty, note
             });
-          } // end for linkedIds
+          }
         }
       }
     } else {
@@ -274,7 +323,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // --- 9) return response
+    // --- return response
     res.setHeader("Access-Control-Allow-Origin", "*");
     return res.status(200).json(resp);
 
