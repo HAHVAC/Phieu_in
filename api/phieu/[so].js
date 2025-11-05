@@ -1,8 +1,6 @@
 // api/phieu/[so].js
-// Handler hoàn chỉnh: lấy tenant token, list phiếu, tìm record robust (normalize + suffix token),
-// lấy linked record_ids từ "Danh sách mặt hàng" rồi batch_get chi tiết vật tư.
-// Dùng fetch native (Node 18+ trên Vercel). Ensure env vars set on Vercel:
-// LARK_APP_ID, LARK_APP_SECRET, PHIEU_APP_TOKEN, PHIEU_TABLE_ID, DATA_APP_TOKEN (opt), DATA_TABLE_ID (opt), LARK_DOMAIN (opt)
+// Full handler: robust search + batch_get items + parse item fields + preserve order
+// Env vars required: LARK_APP_ID, LARK_APP_SECRET, PHIEU_APP_TOKEN, PHIEU_TABLE_ID, DATA_APP_TOKEN (opt), DATA_TABLE_ID (opt)
 
 export default async function handler(req, res) {
   try {
@@ -12,20 +10,15 @@ export default async function handler(req, res) {
     const LARK_DOMAIN = process.env.LARK_DOMAIN || "https://open.larksuite.com";
     const TENANT_TOKEN_URL = `${LARK_DOMAIN}/open-apis/auth/v3/tenant_access_token/internal`;
 
-    // --- 1) tenant token (simple in-memory cache)
+    // --- 1) tenant token (in-memory cache)
     if (!global.__tenantToken || (global.__tenantExpire || 0) < Date.now()) {
       const r = await fetch(TENANT_TOKEN_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          app_id: process.env.LARK_APP_ID,
-          app_secret: process.env.LARK_APP_SECRET
-        })
+        body: JSON.stringify({ app_id: process.env.LARK_APP_ID, app_secret: process.env.LARK_APP_SECRET })
       });
       const j = await r.json();
-      if (!j.tenant_access_token) {
-        return res.status(500).json({ error: "cannot fetch tenant token", raw: j });
-      }
+      if (!j.tenant_access_token) return res.status(500).json({ error: "cannot fetch tenant token", raw: j });
       global.__tenantToken = j.tenant_access_token;
       global.__tenantExpire = Date.now() + ((j.expire || 7200) * 1000) - 30000;
     }
@@ -34,9 +27,8 @@ export default async function handler(req, res) {
     // --- 2) list records from PHIEU table
     const PHIEU_APP_TOKEN = process.env.PHIEU_APP_TOKEN;
     const PHIEU_TABLE_ID = process.env.PHIEU_TABLE_ID;
-    if (!PHIEU_APP_TOKEN || !PHIEU_TABLE_ID) {
-      return res.status(500).json({ error: "Missing PHIEU_APP_TOKEN or PHIEU_TABLE_ID env vars" });
-    }
+    if (!PHIEU_APP_TOKEN || !PHIEU_TABLE_ID) return res.status(500).json({ error: "Missing PHIEU_APP_TOKEN or PHIEU_TABLE_ID env vars" });
+
     const listUrl = `${LARK_DOMAIN}/open-apis/bitable/v1/apps/${PHIEU_APP_TOKEN}/tables/${PHIEU_TABLE_ID}/records`;
     const listResp = await fetch(listUrl, { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }});
     if (!listResp.ok) {
@@ -46,17 +38,20 @@ export default async function handler(req, res) {
     const listJson = await listResp.json();
     const records = (listJson?.data?.items) || (listJson?.records) || [];
 
-    // --- 3) helper: normalize to only alphanumeric (remove diacritics & non-alnum)
+    // --- 3) helpers
     function normalizeAlnum(s){
       if (s === undefined || s === null) return "";
-      return String(s)
-        .normalize('NFD')
-        .replace(/[\u0300-\u036f]/g, '')   // remove diacritics
-        .replace(/[^0-9a-zA-Z]/g, '')      // keep only letters+digits
-        .toLowerCase();
+      return String(s).normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^0-9a-zA-Z]/g, '').toLowerCase();
+    }
+    function valueToHay(v){
+      if (!v && v !== 0) return "";
+      if (typeof v === 'string') return normalizeAlnum(v);
+      if (typeof v === 'object' && v && v.text) return normalizeAlnum(v.text);
+      if (Array.isArray(v)) return normalizeAlnum((v.join(' ')||''));
+      return "";
     }
 
-    // debug: log keys (visible in Vercel runtime logs)
+    // debug sample keys
     try { if (records && records.length) console.log("sample record keys:", Object.keys(records[0].fields || {})); } catch(e){}
 
     // --- 4) build suffix candidates from input 'so'
@@ -66,18 +61,11 @@ export default async function handler(req, res) {
     if (soTokens.length >= 2) suffixCandidates.push( soTokens.slice(1).join('') );
     if (soTokens.length >= 3) suffixCandidates.push( soTokens.slice(-2).join('') );
     if (soTokens.length >= 1) suffixCandidates.push( soTokens.slice(-1).join('') );
-    suffixCandidates.unshift(soNorm); // full normalized first
+    suffixCandidates.unshift(soNorm);
+
     if (debug) console.log("soNorm:", soNorm, "suffixCandidates:", suffixCandidates);
 
-    // --- 5) FIND record using strategies: exact normalized -> normalized contains -> suffix matching
-    function valueToHay(v){
-      if (!v && v !== 0) return "";
-      if (typeof v === 'string') return normalizeAlnum(v);
-      if (typeof v === 'object' && v.text) return normalizeAlnum(v.text);
-      if (Array.isArray(v)) return normalizeAlnum((v.join(' ')||''));
-      return "";
-    }
-
+    // --- 5) FIND record using strategies
     let record = null;
 
     // exact normalized equality
@@ -104,7 +92,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // suffix candidates matching
+    // suffix matching
     if (!record) {
       record = records.find(r => {
         const f = r.fields || r.field_values || {};
@@ -120,7 +108,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // if still not found -> return helpful sample candidates for debugging
+    // if still not found -> return sample candidates
     if (!record) {
       const candidates = records.slice(0,10).map(r=>{
         const f = r.fields || r.field_values || {};
@@ -137,12 +125,12 @@ export default async function handler(req, res) {
       return res.status(404).json({ error: "Phiếu not found (normalized search)", so, total_records: records.length, sample_candidates: candidates });
     }
 
-    // --- 6) Build response meta from found record
+    // --- 6) Build response meta
     const f = record.fields || record.field_values || {};
     const resp = {
       so_phieu: f["Số phiếu"] || f["so_phieu"] || f["Số_phiếu"] || so,
-      hang_muc: f["Hạng mục"] || f["hang_muc"] || "",
-      nhom_ncc: f["Nhóm NCC"] || f["nhom_ncc"] || "",
+      hang_muc: (f["Hạng mục"] && (Array.isArray(f["Hạng mục"]) ? (f["Hạng mục"][0]?.text || f["Hạng mục"][0]) : f["Hạng mục"])) || f["hang_muc"] || "",
+      nhom_ncc: (f["Nhóm NCC"] && (Array.isArray(f["Nhóm NCC"]) ? (f["Nhóm NCC"][0]?.text || f["Nhóm NCC"][0]) : f["Nhóm NCC"])) || f["nhom_ncc"] || "",
       noi_dung: f["Nội dung"] || f["noi_dung"] || "",
       nha_cung: f["Nhà cung cấp"] || f["nha_cung"] || "",
       xuong: f["Xưởng"] || f["xuong"] || "",
@@ -151,11 +139,11 @@ export default async function handler(req, res) {
       items: []
     };
 
-    // --- 7) Extract linked record ids from "Danh sách mặt hàng" style field
+    // --- 7) Extract linkedIds from potential item key
     let linkedIds = [];
     const potentialItemKey = Object.keys(f||{}).find(k => {
       const lk = String(k).toLowerCase();
-      return (lk.includes('danh') && lk.includes('mặt')) || lk.includes('item') || lk.includes('hàng');
+      return (lk.includes('danh') && lk.includes('mặt')) || lk.includes('item') || lk.includes('hàng') || lk.includes('mặt hàng');
     }) || null;
 
     if (potentialItemKey) {
@@ -163,19 +151,40 @@ export default async function handler(req, res) {
       if (Array.isArray(val) && val.length>0) {
         const first = val[0];
         if (first && Array.isArray(first.record_ids)) linkedIds = first.record_ids.slice();
-        else if (first && Array.isArray(first.record_ids) === false && first.record_ids) linkedIds.push(first.record_ids);
+        else if (first && first.record_ids) linkedIds.push(first.record_ids);
       } else if (val && typeof val === 'object') {
         if (Array.isArray(val.record_ids)) linkedIds = val.record_ids.slice();
       }
     }
 
-    // --- 8) If linkedIds exist -> batch_get from DATA table
+    if (debug) console.log("potentialItemKey:", potentialItemKey, "linkedIds:", linkedIds);
+
+    // If debug and requested, optionally run batch_get and return debug info
+    if (debug === "1") {
+      const dbg = { matched_record: record.record_id || record.id, potentialItemKey, linkedIds };
+      if (linkedIds.length) {
+        const DATA_APP_TOKEN = process.env.DATA_APP_TOKEN || PHIEU_APP_TOKEN;
+        const DATA_TABLE_ID = process.env.DATA_TABLE_ID || process.env.PHIEU_TABLE_ID;
+        if (DATA_APP_TOKEN && DATA_TABLE_ID) {
+          const batchUrl = `${LARK_DOMAIN}/open-apis/bitable/v1/apps/${DATA_APP_TOKEN}/tables/${DATA_TABLE_ID}/records/batch_get`;
+          const rBatch = await fetch(batchUrl, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+            body: JSON.stringify({ record_ids: linkedIds })
+          });
+          const raw = await rBatch.text();
+          try { dbg.batch_get = JSON.parse(raw); } catch(e){ dbg.batch_get_raw = raw; }
+        } else dbg.batch_get = "no_data_table_configured";
+      }
+      return res.status(200).json({ debug: dbg });
+    }
+
+    // --- 8) If linkedIds present -> batch_get from DATA table and parse rows
     if (linkedIds.length > 0) {
       const DATA_APP_TOKEN = process.env.DATA_APP_TOKEN || PHIEU_APP_TOKEN;
       const DATA_TABLE_ID = process.env.DATA_TABLE_ID || process.env.PHIEU_TABLE_ID;
       if (!DATA_APP_TOKEN || !DATA_TABLE_ID) {
-        // can't batch_get without data table info; return linked ids for debug
-        resp.items = linkedIds.map(id=>({ record_id: id }));
+        resp.items = linkedIds.map(id => ({ record_id: id }));
       } else {
         const batchUrl = `${LARK_DOMAIN}/open-apis/bitable/v1/apps/${DATA_APP_TOKEN}/tables/${DATA_TABLE_ID}/records/batch_get`;
         const rBatch = await fetch(batchUrl, {
@@ -183,26 +192,78 @@ export default async function handler(req, res) {
           headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
           body: JSON.stringify({ record_ids: linkedIds })
         });
+
         if (!rBatch.ok) {
           const txt = await rBatch.text();
           console.error("batch_get failed:", rBatch.status, txt);
-          resp.items = linkedIds.map(id=>({ record_id: id }));
+          resp.items = linkedIds.map(id => ({ record_id: id }));
         } else {
           const jb = await rBatch.json();
           const rows = jb?.data?.items || jb?.records || [];
-          for(const row of rows){
-            const rf = row.fields || {};
-            resp.items.push({
-              name: rf["Tên VTHH"] || rf["Tên Vật tư"] || rf["Tên"] || rf["name"] || (rf.text_arr && rf.text_arr[0]) || '',
-              unit: rf["Đơn vị tính"] || rf["Đơn vị"] || rf["unit"] || '',
-              qty: rf["Số lượng"] || rf["qty"] || rf["Số lượng (thực)"] || '',
-              note: rf["Ghi chú"] || rf["note"] || ''
-            });
+
+          // map rows by record_id for preserving input order
+          const rowById = {};
+          for (const row of rows) rowById[row.record_id || row.id] = row;
+
+          // helper to get text from field shapes
+          function txt(field) {
+            if (!field && field !== 0) return '';
+            if (Array.isArray(field) && field.length) {
+              const first = field[0];
+              if (first && typeof first === 'object' && 'text' in first) return String(first.text).trim();
+              if (typeof field[0] === 'string') return String(field[0]).trim();
+            }
+            if (typeof field === 'object' && field.text) return String(field.text).trim();
+            if (typeof field === 'string') return field.trim();
+            return '';
           }
+
+          // iterate linkedIds to preserve order
+          for (const rid of linkedIds) {
+            const row = rowById[rid];
+            if (!row) {
+              resp.items.push({ record_id: rid });
+              continue;
+            }
+            const rf = row.fields || {};
+
+            // basic fields
+            const name = txt(rf["Tên VTHH"] || rf["Tên Vật tư"] || rf["Tên"] || rf["name"] ) || '';
+            let unit = txt(rf["Đơn vị tính"] || rf["Đơn vị"] || rf["unit"]) || '';
+            const note = txt(rf["Ghi chú"] || rf["note"] ) || '';
+
+            // qty parse: try item_string first, then Số lượng field
+            let qty = '';
+            try {
+              const itemStrObj = rf["item_string"];
+              if (itemStrObj && typeof itemStrObj === 'object') {
+                const val = itemStrObj.value || itemStrObj["value"];
+                if (Array.isArray(val) && val.length) {
+                  const first = String(val[0]);
+                  const m = first.match(/text=([^;}]*)/);
+                  if (m && m[1]) {
+                    const parts = m[1].split('~').map(s=>s.trim());
+                    if (parts.length >= 3) qty = parts[2];
+                    else if (parts.length >= 2 && !unit) unit = parts[1];
+                  }
+                }
+              }
+            } catch(e){}
+
+            if (!qty) {
+              const qf = rf["Số lượng"] || rf["qty"] || rf["Số lượng (thực)"];
+              if (qf) qty = txt(qf);
+            }
+
+            resp.items.push({
+              record_id: row.record_id || row.id || null,
+              name, unit, qty, note
+            });
+          } // end for linkedIds
         }
       }
     } else {
-      // fallback: if potentialItemKey had text_arr or array of strings, map them
+      // fallback: if potentialItemKey had text_arr or array-of-strings, map them
       if (potentialItemKey) {
         const val = f[potentialItemKey];
         if (Array.isArray(val) && val[0] && Array.isArray(val[0].text_arr)) {
@@ -213,7 +274,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // --- 9) Return
+    // --- 9) return response
     res.setHeader("Access-Control-Allow-Origin", "*");
     return res.status(200).json(resp);
 
